@@ -53,6 +53,7 @@ def _worker_main(
         try:
             sampling = SamplingParams(**req["sampling_params"])
             prompt_kind = req.get("prompt_kind", "text")
+            stream = bool(req.get("stream", False))
 
             if prompt_kind == "chat":
                 prompt_text = build_chat_prompt(llm.tokenizer, req["messages"])
@@ -71,6 +72,9 @@ def _worker_main(
                 "request_id": request_id,
                 "prompt_tokens": len(prompt_token_ids),
                 "max_tokens": sampling.max_tokens,
+                "stream": stream,
+                "stream_token_ids": [] if stream else None,
+                "stream_text": "" if stream else None,
             }
         except Exception as exc:
             fail_request(request_id, exc)
@@ -86,12 +90,38 @@ def _worker_main(
 
         if active:
             try:
-                outputs, _ = llm.step()
+                outputs, _, step_updates = llm.step_with_updates()
             except Exception as exc:
                 for state in active.values():
                     fail_request(state["request_id"], exc)
                 active.clear()
                 continue
+
+            for seq_id, token_id in step_updates:
+                state = active.get(seq_id)
+                if state is None or not state["stream"]:
+                    continue
+                stream_token_ids = state["stream_token_ids"]
+                stream_token_ids.append(token_id)
+                decoded = llm.tokenizer.decode(stream_token_ids)
+                prev_text = state["stream_text"]
+                if decoded.startswith(prev_text):
+                    delta_text = decoded[len(prev_text):]
+                else:
+                    # Fallback for rare tokenizer edge-cases where incremental
+                    # decode does not preserve strict prefix relation.
+                    delta_text = decoded
+                state["stream_text"] = decoded
+                if not delta_text:
+                    continue
+                response_queue.put(
+                    {
+                        "type": "delta",
+                        "request_id": state["request_id"],
+                        "ok": True,
+                        "text": delta_text,
+                    }
+                )
 
             for seq_id, token_ids in outputs:
                 state = active.pop(seq_id, None)
@@ -166,8 +196,6 @@ class SagaEngineClient:
             except queue.Empty:
                 continue
 
-            if message.get("type") != "result":
-                continue
             request_id = message.get("request_id")
             if not isinstance(request_id, str):
                 continue
@@ -182,19 +210,20 @@ class SagaEngineClient:
             except queue.Full:
                 continue
 
-    def generate(
+    def _submit_request(
         self,
         *,
         prompt_kind: str,
         sampling_params: dict[str, Any],
         prompt: str | list[int] | None = None,
         messages: list[dict[str, str]] | None = None,
-    ) -> dict[str, Any]:
+        stream: bool = False,
+    ) -> tuple[str, queue.Queue]:
         if not self._process.is_alive():
             raise RuntimeError("engine worker is not alive")
 
         request_id = uuid.uuid4().hex
-        mailbox: queue.Queue = queue.Queue(maxsize=1)
+        mailbox: queue.Queue = queue.Queue()
         with self._pending_lock:
             self._pending[request_id] = mailbox
 
@@ -203,6 +232,7 @@ class SagaEngineClient:
             "request_id": request_id,
             "prompt_kind": prompt_kind,
             "sampling_params": sampling_params,
+            "stream": stream,
         }
         if prompt_kind == "chat":
             payload["messages"] = messages or []
@@ -210,9 +240,29 @@ class SagaEngineClient:
             payload["prompt"] = prompt
 
         self._request_queue.put(payload)
+        return request_id, mailbox
+
+    def generate(
+        self,
+        *,
+        prompt_kind: str,
+        sampling_params: dict[str, Any],
+        prompt: str | list[int] | None = None,
+        messages: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        request_id, mailbox = self._submit_request(
+            prompt_kind=prompt_kind,
+            sampling_params=sampling_params,
+            prompt=prompt,
+            messages=messages,
+            stream=False,
+        )
 
         try:
-            result = mailbox.get(timeout=self._request_timeout)
+            while True:
+                result = mailbox.get(timeout=self._request_timeout)
+                if result.get("type") == "result":
+                    break
         except queue.Empty as exc:
             raise TimeoutError("request timeout while waiting for model output") from exc
         finally:
@@ -222,6 +272,44 @@ class SagaEngineClient:
         if not result.get("ok", False):
             raise RuntimeError(result.get("error", "unknown worker error"))
         return result
+
+    def stream_generate(
+        self,
+        *,
+        prompt_kind: str,
+        sampling_params: dict[str, Any],
+        prompt: str | list[int] | None = None,
+        messages: list[dict[str, str]] | None = None,
+    ):
+        request_id, mailbox = self._submit_request(
+            prompt_kind=prompt_kind,
+            sampling_params=sampling_params,
+            prompt=prompt,
+            messages=messages,
+            stream=True,
+        )
+
+        try:
+            while True:
+                try:
+                    message = mailbox.get(timeout=self._request_timeout)
+                except queue.Empty as exc:
+                    raise TimeoutError("request timeout while waiting for streamed output") from exc
+
+                msg_type = message.get("type")
+                if msg_type == "delta":
+                    if message.get("ok", False):
+                        yield message
+                    continue
+
+                if msg_type == "result":
+                    if not message.get("ok", False):
+                        raise RuntimeError(message.get("error", "unknown worker error"))
+                    yield message
+                    return
+        finally:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
 
     def close(self):
         if self._closed.is_set():

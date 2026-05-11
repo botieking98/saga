@@ -70,14 +70,14 @@ outputs = llm.generate(
 )
 ```
 
-## OpenAI 兼容服务（非流式）
+## OpenAI 兼容服务
 
 提供 `FastAPI(API 进程) + 独立推理 Worker(队列持续批处理)` 架构，支持 OpenAI 兼容接口：
 
 - `GET /health`
 - `GET /v1/models`
-- `POST /v1/chat/completions`（`stream=true` 暂不支持）
-- `POST /v1/completions`（`n=1`）
+- `POST /v1/chat/completions`（支持 `stream=true/false`）
+- `POST /v1/completions`（`n=1`，`stream=true` 当前仅支持单 prompt）
 
 启动：
 
@@ -109,6 +109,26 @@ python3 benchmark/bench.py
 ```
 
 默认会打印总 token、耗时和吞吐。
+
+在线服务压测脚本（参考 mini-sglang online benchmark 风格）：
+
+```bash
+python3 benchmark/bench_online.py \
+  --base-url http://127.0.0.1:8000 \
+  --model-path ~/huggingface/Qwen3-0.6B \
+  --num-requests 200 \
+  --concurrency 32 \
+  --input-len 256 \
+  --output-len 128 \
+  --stream
+```
+
+脚本会输出：
+- 请求吞吐（req/s）
+- token 吞吐（total/completion tok/s）
+- 延迟统计（avg / p50 / p95 / p99 / max）
+- TTFT（首 token 时延，`--stream` 模式）
+- TPOT（单 token 间隔，`--stream` 模式；非流式为估算值）
 
 ## 当前限制
 

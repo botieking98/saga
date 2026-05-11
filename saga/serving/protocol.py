@@ -59,10 +59,6 @@ def normalize_prompts(raw_prompt: Any) -> list[str | list[int]]:
 
 
 def parse_sampling_params(payload: dict[str, Any]) -> dict[str, Any]:
-    stream = payload.get("stream", False)
-    if stream:
-        raise ValueError("stream=true is not supported")
-
     max_tokens = int(payload.get("max_tokens", 64))
     if max_tokens <= 0:
         raise ValueError("max_tokens must be > 0")

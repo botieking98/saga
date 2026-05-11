@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -89,6 +91,67 @@ def create_app(args: ServerArgs) -> FastAPI:
         try:
             sampling_params = parse_sampling_params(payload)
             messages = normalize_chat_messages(req.messages)
+
+            if req.stream:
+                response_id = f"chatcmpl-{uuid.uuid4().hex}"
+                created = int(time.time())
+                model_name = app.state.model_name
+
+                def stream_iter():
+                    header = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(header, ensure_ascii=False)}\n\n"
+
+                    for message in app.state.engine.stream_generate(
+                        prompt_kind="chat",
+                        sampling_params=sampling_params,
+                        messages=messages,
+                    ):
+                        if message.get("type") == "delta":
+                            text = message.get("text", "")
+                            if not text:
+                                continue
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": text},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            continue
+
+                        if message.get("type") == "result":
+                            end = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": message.get("finish_reason", "stop"),
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+
+                return StreamingResponse(stream_iter(), media_type="text/event-stream")
+
             result = await run_in_threadpool(
                 app.state.engine.generate,
                 prompt_kind="chat",
@@ -132,6 +195,65 @@ def create_app(args: ServerArgs) -> FastAPI:
         try:
             sampling_params = parse_sampling_params(payload)
             prompts = normalize_prompts(req.prompt)
+
+            if req.stream:
+                if len(prompts) != 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="stream=true for /v1/completions currently supports a single prompt only",
+                    )
+
+                response_id = f"cmpl-{uuid.uuid4().hex}"
+                created = int(time.time())
+                model_name = app.state.model_name
+
+                def stream_iter():
+                    for message in app.state.engine.stream_generate(
+                        prompt_kind="text",
+                        sampling_params=sampling_params,
+                        prompt=prompts[0],
+                    ):
+                        if message.get("type") == "delta":
+                            text = message.get("text", "")
+                            if not text:
+                                continue
+                            chunk = {
+                                "id": response_id,
+                                "object": "text_completion",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "text": text,
+                                        "logprobs": None,
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            continue
+
+                        if message.get("type") == "result":
+                            end = {
+                                "id": response_id,
+                                "object": "text_completion",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "text": "",
+                                        "logprobs": None,
+                                        "finish_reason": message.get("finish_reason", "stop"),
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+
+                return StreamingResponse(stream_iter(), media_type="text/event-stream")
 
             tasks = [
                 run_in_threadpool(
