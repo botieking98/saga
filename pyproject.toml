@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saga"
+version = "0.1.0"
+license = "MIT"
+readme = "README.md"
+description = "a lightweight LLM inference engine with OpenAI-compatible serving"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "transformers>=4.51.0",
+    "flash-attn",
+    "xxhash",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.urls]
+Homepage="https://github.com/botieking98/saga"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["saga*"]
+
+[project.scripts]
+saga = "saga.serving.launch:main"
+saga-openai-api = "saga.serving.launch:main"
