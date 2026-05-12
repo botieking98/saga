@@ -16,6 +16,8 @@ ENGINE_CLI_FIELD_NAMES = (
     "max_prefill_tokens_per_step",
     "gpu_memory_utilization",
     "tensor_parallel_size",
+    "dist_init_addr",
+    "dist_init_port",
     "enforce_eager",
 )
 
@@ -44,7 +46,7 @@ class ServerArgs:
         return model_name or "saga-model"
 
     @property
-    def llm_kwargs(self) -> dict[str, int | float | bool]:
+    def llm_kwargs(self) -> dict[str, int | float | bool | str]:
         return dict(self.engine_kwargs or {})
 
 
@@ -77,6 +79,18 @@ def parse_args(argv: list[str] | None = None) -> ServerArgs:
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=_config_default("gpu_memory_utilization"))
     parser.add_argument("--tensor-parallel-size", type=int, default=_config_default("tensor_parallel_size"))
+    parser.add_argument(
+        "--dist-init-addr",
+        type=str,
+        default=_config_default("dist_init_addr"),
+        help="address used by torch.distributed init_method tcp://<addr>:<port>",
+    )
+    parser.add_argument(
+        "--dist-init-port",
+        type=int,
+        default=_config_default("dist_init_port"),
+        help="port used by torch.distributed init_method; 0 means auto-select a free port",
+    )
     parser.add_argument("--enforce-eager", action="store_true")
 
     parser.add_argument("--startup-timeout", type=float, default=300.0)

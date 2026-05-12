@@ -88,6 +88,16 @@ python -m saga \
   --port 8000
 ```
 
+开启张量并行（示例 2 卡）：
+
+```bash
+python -m saga \
+  --model ~/huggingface/Qwen3-0.6B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2
+```
+
 等价命令：
 
 ```bash
@@ -106,6 +116,11 @@ continuous batching 可调参数：
 - `--disable-continuous-batching`：关闭连续批处理，退回 prefill 优先调度
 - `--decode-steps-per-prefill`：有 running+waiting 时，连续 decode 步数上限（默认 4）
 - `--max-prefill-tokens-per-step`：混合负载下单步 prefill token 上限（默认 2048）
+
+分布式初始化参数（tensor parallel 时生效）：
+
+- `--dist-init-addr`：`torch.distributed` 初始化地址（默认 `127.0.0.1`）
+- `--dist-init-port`：初始化端口（默认 `0`，表示自动选择空闲端口）
 
 ## 基准测试
 
@@ -158,7 +173,8 @@ python3 benchmark/bench_online.py \
 - 当前模型实现聚焦 Qwen3（见 `saga/models/qwen3.py`）。
 - `SamplingParams` 不允许贪心采样（`temperature` 必须大于 `1e-10`）。
 - `model` 参数要求是本地目录路径。
-- `tensor_parallel_size` 当前限制在 `1~8`，多卡通信默认使用 `tcp://localhost:2333`。
+- `tensor_parallel_size` 当前限制在 `1~8`，且需不超过可见 GPU 数。
+- `num_attention_heads` / `num_key_value_heads` 必须能被 `tensor_parallel_size` 整除。
 
 ## 目录结构
 
