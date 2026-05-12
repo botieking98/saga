@@ -68,6 +68,9 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    def get_prefix_cache_stats(self, reset: bool = False) -> dict[str, int | float]:
+        return self.scheduler.get_prefix_cache_stats(reset=reset)
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],

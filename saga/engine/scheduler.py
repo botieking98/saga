@@ -19,6 +19,9 @@ class Scheduler:
     def is_finished(self):
         return not self.waiting and not self.running
 
+    def get_prefix_cache_stats(self, reset: bool = False) -> dict[str, int | float]:
+        return self.block_manager.get_prefix_cache_stats(reset=reset)
+
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 

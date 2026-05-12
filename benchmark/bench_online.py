@@ -82,6 +82,46 @@ def generate_prompt(tokenizer: Any, n_tokens: int, rng: random.Random) -> str:
     raise RuntimeError("failed to generate prompt with exact token length")
 
 
+def build_prompts(
+    tokenizer: Any,
+    *,
+    n_requests: int,
+    input_len: int,
+    rng: random.Random,
+    prompt_mode: str,
+    shared_prefix_len: int,
+    num_shared_prefixes: int,
+) -> tuple[list[str], dict[str, Any]]:
+    if prompt_mode == "random":
+        prompts = [generate_prompt(tokenizer, input_len, rng) for _ in range(n_requests)]
+        return prompts, {"prompt_mode": "random"}
+
+    if prompt_mode != "shared_prefix":
+        raise ValueError(f"unsupported prompt mode: {prompt_mode}")
+
+    if not (0 <= shared_prefix_len <= input_len):
+        raise ValueError("--shared-prefix-len must be within [0, --input-len]")
+    if num_shared_prefixes <= 0:
+        raise ValueError("--num-shared-prefixes must be > 0")
+
+    suffix_len = input_len - shared_prefix_len
+    prefixes = [
+        generate_prompt(tokenizer, shared_prefix_len, rng) if shared_prefix_len > 0 else ""
+        for _ in range(num_shared_prefixes)
+    ]
+    prompts: list[str] = []
+    for i in range(n_requests):
+        suffix = generate_prompt(tokenizer, suffix_len, rng) if suffix_len > 0 else ""
+        prompts.append(prefixes[i % num_shared_prefixes] + suffix)
+
+    return prompts, {
+        "prompt_mode": "shared_prefix",
+        "shared_prefix_len": shared_prefix_len,
+        "suffix_len": suffix_len,
+        "num_shared_prefixes": num_shared_prefixes,
+    }
+
+
 def one_request_non_stream(
     base_url: str,
     model: str,
@@ -258,8 +298,31 @@ async def run_benchmark(args: argparse.Namespace) -> list[BenchResult]:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.model_path)
     rng = random.Random(args.seed)
 
-    prompts = [generate_prompt(tokenizer, args.input_len, rng) for _ in range(args.num_requests)]
+    prompts, prompt_meta = build_prompts(
+        tokenizer,
+        n_requests=args.num_requests,
+        input_len=args.input_len,
+        rng=rng,
+        prompt_mode=args.prompt_mode,
+        shared_prefix_len=args.shared_prefix_len,
+        num_shared_prefixes=args.num_shared_prefixes,
+    )
     prompt_token_lens = [len(tokenizer.encode(p, add_special_tokens=False)) for p in prompts]
+    print(f"Prompt Mode: {prompt_meta['prompt_mode']}")
+    if prompt_meta["prompt_mode"] == "shared_prefix":
+        print(
+            "Shared Prefix Config: "
+            f"prefix_len={prompt_meta['shared_prefix_len']}, "
+            f"suffix_len={prompt_meta['suffix_len']}, "
+            f"num_prefixes={prompt_meta['num_shared_prefixes']}"
+        )
+    print(
+        "Prompt Token Lens: "
+        f"target={args.input_len}, "
+        f"avg={sum(prompt_token_lens)/len(prompt_token_lens):.2f}, "
+        f"min={min(prompt_token_lens)}, "
+        f"max={max(prompt_token_lens)}"
+    )
 
     # Warm-up request.
     _ = one_request(
@@ -314,6 +377,9 @@ async def run_benchmark(args: argparse.Namespace) -> list[BenchResult]:
                 "temperature": args.temperature,
                 "seed": args.seed,
                 "stream": args.stream,
+                "prompt_mode": args.prompt_mode,
+                "shared_prefix_len": args.shared_prefix_len,
+                "num_shared_prefixes": args.num_shared_prefixes,
             },
             "results": [asdict(r) for r in results],
         }
@@ -406,6 +472,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--input-len", type=int, default=256)
     parser.add_argument("--output-len", type=int, default=128)
+    parser.add_argument(
+        "--prompt-mode",
+        choices=["random", "shared_prefix"],
+        default="random",
+        help="prompt generation mode",
+    )
+    parser.add_argument(
+        "--shared-prefix-len",
+        type=int,
+        default=-1,
+        help="prefix length used when --prompt-mode=shared_prefix; -1 means auto (75%% of input-len)",
+    )
+    parser.add_argument(
+        "--num-shared-prefixes",
+        type=int,
+        default=1,
+        help="number of distinct shared prefixes when --prompt-mode=shared_prefix",
+    )
 
     parser.add_argument("--stream", action="store_true", help="use stream=true to collect TTFT/TPOT")
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -432,6 +516,19 @@ def main() -> None:
     if not args.model_path:
         raise ValueError("--model-path is required for tokenizer loading")
     args.model_path = os.path.expanduser(args.model_path)
+
+    if args.prompt_mode == "shared_prefix":
+        if args.shared_prefix_len == -1:
+            args.shared_prefix_len = max(1, int(args.input_len * 0.75))
+        if not (0 <= args.shared_prefix_len <= args.input_len):
+            raise ValueError("--shared-prefix-len must be within [0, --input-len]")
+        if args.num_shared_prefixes <= 0:
+            raise ValueError("--num-shared-prefixes must be > 0")
+    else:
+        if args.shared_prefix_len == -1:
+            args.shared_prefix_len = 0
+        if args.num_shared_prefixes <= 0:
+            raise ValueError("--num-shared-prefixes must be > 0")
 
     asyncio.run(run_benchmark(args))
 

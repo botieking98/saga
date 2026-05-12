@@ -123,6 +123,22 @@ python3 benchmark/bench_online.py \
   --stream
 ```
 
+高共享前缀压测（用于观察前缀缓存收益）：
+
+```bash
+python3 benchmark/bench_online.py \
+  --base-url http://127.0.0.1:8000 \
+  --model-path ~/huggingface/Qwen3-0.6B \
+  --num-requests 200 \
+  --concurrency 32 \
+  --input-len 256 \
+  --output-len 128 \
+  --stream \
+  --prompt-mode shared_prefix \
+  --shared-prefix-len 192 \
+  --num-shared-prefixes 1
+```
+
 脚本会输出：
 - 请求吞吐（req/s）
 - token 吞吐（total/completion tok/s）
