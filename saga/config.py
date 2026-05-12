@@ -9,6 +9,9 @@ class Config:
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
+    enable_continuous_batching: bool = True
+    decode_steps_per_prefill: int = 4
+    max_prefill_tokens_per_step: int = 2048
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
@@ -20,6 +23,8 @@ class Config:
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
+        assert self.decode_steps_per_prefill >= 1
+        assert self.max_prefill_tokens_per_step > 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

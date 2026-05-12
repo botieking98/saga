@@ -10,11 +10,15 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.enable_continuous_batching = config.enable_continuous_batching
+        self.decode_steps_per_prefill = config.decode_steps_per_prefill
+        self.max_prefill_tokens_per_step = config.max_prefill_tokens_per_step
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self._decode_steps_since_prefill = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -25,14 +29,13 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def _schedule_prefill(self, token_budget: int) -> list[Sequence]:
         scheduled_seqs = []
         num_batched_tokens = 0
 
-        # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
+            remaining = token_budget - num_batched_tokens
             if remaining == 0:
                 break
             if not seq.block_table:
@@ -42,8 +45,6 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
@@ -53,11 +54,10 @@ class Scheduler:
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
+        return scheduled_seqs
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
+    def _schedule_decode(self) -> list[Sequence]:
+        scheduled_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
@@ -71,9 +71,44 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        if not scheduled_seqs:
+            return []
         self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return scheduled_seqs
+
+    def schedule(self) -> tuple[list[Sequence], bool]:
+        if self.enable_continuous_batching and self.running and self.waiting:
+            if self._decode_steps_since_prefill < self.decode_steps_per_prefill:
+                decode_seqs = self._schedule_decode()
+                if decode_seqs:
+                    self._decode_steps_since_prefill += 1
+                    return decode_seqs, False
+
+                prefill_seqs = self._schedule_prefill(self.max_prefill_tokens_per_step)
+                if prefill_seqs:
+                    self._decode_steps_since_prefill = 0
+                    return prefill_seqs, True
+            else:
+                prefill_seqs = self._schedule_prefill(self.max_prefill_tokens_per_step)
+                if prefill_seqs:
+                    self._decode_steps_since_prefill = 0
+                    return prefill_seqs, True
+
+                decode_seqs = self._schedule_decode()
+                if decode_seqs:
+                    self._decode_steps_since_prefill += 1
+                    return decode_seqs, False
+
+        prefill_seqs = self._schedule_prefill(self.max_num_batched_tokens)
+        if prefill_seqs:
+            self._decode_steps_since_prefill = 0
+            return prefill_seqs, True
+
+        decode_seqs = self._schedule_decode()
+        if decode_seqs:
+            self._decode_steps_since_prefill += 1
+            return decode_seqs, False
+        raise RuntimeError("scheduler has neither prefill nor decode work")
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING

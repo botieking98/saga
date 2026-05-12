@@ -130,6 +130,9 @@ def one_request_non_stream(
     max_tokens: int,
     temperature: float,
     timeout_s: float,
+    ignore_eos: bool,
+    min_tokens: int,
+    tokenizer: Any | None = None,
 ) -> BenchResult:
     payload = {
         "model": model,
@@ -138,6 +141,10 @@ def one_request_non_stream(
         "temperature": temperature,
         "stream": False,
     }
+    if ignore_eos:
+        payload["ignore_eos"] = True
+    if min_tokens > 0:
+        payload["min_tokens"] = min_tokens
 
     start = time.perf_counter()
     try:
@@ -179,6 +186,9 @@ def one_request_stream(
     max_tokens: int,
     temperature: float,
     timeout_s: float,
+    ignore_eos: bool,
+    min_tokens: int,
+    tokenizer: Any | None = None,
 ) -> BenchResult:
     payload = {
         "model": model,
@@ -187,6 +197,10 @@ def one_request_stream(
         "temperature": temperature,
         "stream": True,
     }
+    if ignore_eos:
+        payload["ignore_eos"] = True
+    if min_tokens > 0:
+        payload["min_tokens"] = min_tokens
 
     data = json.dumps(payload).encode("utf-8")
     req = urlrequest.Request(
@@ -199,8 +213,7 @@ def one_request_stream(
     start = time.perf_counter()
     first_token_at: float | None = None
     last_token_at: float | None = None
-    inter_token_gaps: list[float] = []
-    completion_tokens = 0
+    completion_text_parts: list[str] = []
 
     try:
         with urlrequest.urlopen(req, timeout=timeout_s) as resp:
@@ -224,11 +237,9 @@ def one_request_stream(
 
                 if text:
                     now = time.perf_counter()
-                    completion_tokens += 1
+                    completion_text_parts.append(text)
                     if first_token_at is None:
                         first_token_at = now
-                    if last_token_at is not None:
-                        inter_token_gaps.append(now - last_token_at)
                     last_token_at = now
 
                 finish_reason = choice.get("finish_reason")
@@ -236,8 +247,16 @@ def one_request_stream(
                     break
 
         latency = time.perf_counter() - start
+        completion_text = "".join(completion_text_parts)
+        if tokenizer is not None:
+            completion_tokens = len(tokenizer.encode(completion_text, add_special_tokens=False))
+        else:
+            completion_tokens = len(completion_text_parts)
         ttft = (first_token_at - start) if first_token_at is not None else None
-        tpot = (sum(inter_token_gaps) / len(inter_token_gaps)) if inter_token_gaps else None
+        if first_token_at is not None and completion_tokens > 1:
+            tpot = (latency - (first_token_at - start)) / (completion_tokens - 1)
+        else:
+            tpot = None
 
         return BenchResult(
             ok=True,
@@ -269,6 +288,9 @@ def one_request(
     temperature: float,
     timeout_s: float,
     stream: bool,
+    ignore_eos: bool,
+    min_tokens: int,
+    tokenizer: Any | None = None,
 ) -> BenchResult:
     if stream:
         return one_request_stream(
@@ -279,6 +301,9 @@ def one_request(
             max_tokens,
             temperature,
             timeout_s,
+            ignore_eos,
+            min_tokens,
+            tokenizer,
         )
     return one_request_non_stream(
         base_url,
@@ -288,6 +313,9 @@ def one_request(
         max_tokens,
         temperature,
         timeout_s,
+        ignore_eos,
+        min_tokens,
+        tokenizer,
     )
 
 
@@ -334,6 +362,9 @@ async def run_benchmark(args: argparse.Namespace) -> list[BenchResult]:
         args.temperature,
         args.timeout,
         args.stream,
+        args.ignore_eos,
+        args.min_tokens,
+        tokenizer,
     )
 
     sem = asyncio.Semaphore(args.concurrency)
@@ -351,6 +382,9 @@ async def run_benchmark(args: argparse.Namespace) -> list[BenchResult]:
             args.temperature,
             args.timeout,
             args.stream,
+            args.ignore_eos,
+            args.min_tokens,
+            tokenizer,
         )
 
     async def wrapped(prompt: str, prompt_tokens: int) -> BenchResult:
@@ -377,6 +411,8 @@ async def run_benchmark(args: argparse.Namespace) -> list[BenchResult]:
                 "temperature": args.temperature,
                 "seed": args.seed,
                 "stream": args.stream,
+                "ignore_eos": args.ignore_eos,
+                "min_tokens": args.min_tokens,
                 "prompt_mode": args.prompt_mode,
                 "shared_prefix_len": args.shared_prefix_len,
                 "num_shared_prefixes": args.num_shared_prefixes,
@@ -492,6 +528,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--stream", action="store_true", help="use stream=true to collect TTFT/TPOT")
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="set ignore_eos=true in request payload to avoid early EOS stop",
+    )
+    parser.add_argument(
+        "--min-tokens",
+        type=int,
+        default=0,
+        help="set min_tokens in request payload (if backend supports it)",
+    )
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -509,6 +556,10 @@ def main() -> None:
         raise ValueError("--input-len must be > 0")
     if args.output_len <= 0:
         raise ValueError("--output-len must be > 0")
+    if args.min_tokens < 0:
+        raise ValueError("--min-tokens must be >= 0")
+    if args.min_tokens > args.output_len:
+        raise ValueError("--min-tokens must be <= --output-len")
 
     if args.temperature <= 1e-10:
         raise ValueError("--temperature must be > 1e-10")

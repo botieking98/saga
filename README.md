@@ -98,7 +98,14 @@ saga-openai-api --model ~/huggingface/Qwen3-0.6B --host 0.0.0.0 --port 8000
 
 - 请求里的 `model` 字段会被忽略，服务始终使用启动时 `--model` 对应模型。
 - Worker 在内部持续拉取请求并动态并入调度队列，复用 saga 的 prefill/decode 调度能力。
+- 默认启用 continuous batching（decode 优先 + chunked prefill 限流）以降低 decode 被 prefill 挤压的风险。
 - 推荐单进程运行 `uvicorn workers=1`（脚本默认如此），由内部 worker 负责并发推理。
+
+continuous batching 可调参数：
+
+- `--disable-continuous-batching`：关闭连续批处理，退回 prefill 优先调度
+- `--decode-steps-per-prefill`：有 running+waiting 时，连续 decode 步数上限（默认 4）
+- `--max-prefill-tokens-per-step`：混合负载下单步 prefill token 上限（默认 2048）
 
 ## 基准测试
 

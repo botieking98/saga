@@ -12,6 +12,8 @@ ENGINE_CLI_FIELD_NAMES = (
     "max_num_batched_tokens",
     "max_num_seqs",
     "max_model_len",
+    "decode_steps_per_prefill",
+    "max_prefill_tokens_per_step",
     "gpu_memory_utilization",
     "tensor_parallel_size",
     "enforce_eager",
@@ -56,6 +58,23 @@ def parse_args(argv: list[str] | None = None) -> ServerArgs:
     parser.add_argument("--max-num-batched-tokens", type=int, default=_config_default("max_num_batched_tokens"))
     parser.add_argument("--max-num-seqs", type=int, default=_config_default("max_num_seqs"))
     parser.add_argument("--max-model-len", type=int, default=_config_default("max_model_len"))
+    parser.add_argument(
+        "--disable-continuous-batching",
+        action="store_true",
+        help="disable decode-priority continuous batching scheduler policy",
+    )
+    parser.add_argument(
+        "--decode-steps-per-prefill",
+        type=int,
+        default=_config_default("decode_steps_per_prefill"),
+        help="when running and waiting coexist, run this many decode steps before one prefill step",
+    )
+    parser.add_argument(
+        "--max-prefill-tokens-per-step",
+        type=int,
+        default=_config_default("max_prefill_tokens_per_step"),
+        help="prefill token cap per scheduler step when running and waiting coexist",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=_config_default("gpu_memory_utilization"))
     parser.add_argument("--tensor-parallel-size", type=int, default=_config_default("tensor_parallel_size"))
     parser.add_argument("--enforce-eager", action="store_true")
@@ -65,6 +84,7 @@ def parse_args(argv: list[str] | None = None) -> ServerArgs:
 
     ns = parser.parse_args(argv)
     engine_kwargs = {name: getattr(ns, name) for name in ENGINE_CLI_FIELD_NAMES}
+    engine_kwargs["enable_continuous_batching"] = not ns.disable_continuous_batching
     return ServerArgs(
         model=ns.model,
         host=ns.host,
