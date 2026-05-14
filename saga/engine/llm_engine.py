@@ -9,7 +9,7 @@ import torch.multiprocessing as mp
 from saga.config import Config
 from saga.sampling_params import SamplingParams
 from saga.engine.sequence import Sequence
-from saga.engine.scheduler import Scheduler
+from saga.engine.scheduler import Scheduler, Batch
 from saga.engine.model_runner import ModelRunner
 
 
@@ -36,6 +36,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._inflight: tuple[int, Batch] | None = None
         atexit.register(self.exit)
 
     @staticmethod
@@ -61,22 +62,41 @@ class LLMEngine:
         outputs, num_tokens, _ = self.step_with_updates()
         return outputs, num_tokens
 
+    def _launch_one_batch(self, batch: Batch) -> int:
+        ticket = self.model_runner.new_ticket()
+        self.model_runner.call("launch", batch, ticket)
+        return ticket
+
     def step_with_updates(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        prev_completion_tokens = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if self._inflight is None:
+            batch = self.scheduler.schedule_next_batch()
+            if batch is None:
+                raise RuntimeError("scheduler has neither prefill nor decode work")
+            ticket = self._launch_one_batch(batch)
+            self._inflight = (ticket, batch)
+
+        next_inflight: tuple[int, Batch] | None = None
+        next_batch = self.scheduler.schedule_next_batch()
+        if next_batch is not None:
+            next_ticket = self._launch_one_batch(next_batch)
+            next_inflight = (next_ticket, next_batch)
+
+        ticket, batch = self._inflight
+        num_tokens = sum(seq.num_scheduled_tokens for seq in batch.seqs) if batch.is_prefill else -len(batch.seqs)
+        prev_completion_tokens = {seq.seq_id: seq.num_completion_tokens for seq in batch.seqs}
+        token_ids = self.model_runner.call("collect", ticket)
+        self.scheduler.postprocess(batch, token_ids)
+        self._inflight = next_inflight
         step_updates = [
             (seq.seq_id, token_id)
-            for seq, token_id in zip(seqs, token_ids)
+            for seq, token_id in zip(batch.seqs, token_ids)
             if seq.num_completion_tokens > prev_completion_tokens[seq.seq_id]
         ]
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in batch.seqs if seq.is_finished]
         return outputs, num_tokens, step_updates
 
     def is_finished(self):
-        return self.scheduler.is_finished()
+        return self.scheduler.is_finished() and self._inflight is None
 
     def get_prefix_cache_stats(self, reset: bool = False) -> dict[str, int | float]:
         return self.scheduler.get_prefix_cache_stats(reset=reset)

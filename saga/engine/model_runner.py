@@ -1,4 +1,5 @@
 import pickle
+from itertools import count
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -6,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from saga.config import Config
 from saga.engine.sequence import Sequence
+from saga.engine.scheduler import Batch
 from saga.models.qwen3 import Qwen3ForCausalLM
 from saga.layers.sampler import Sampler
 from saga.utils.context import set_context, get_context, reset_context
@@ -22,6 +24,8 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self._ticket_counter = count()
+        self._pending_outputs: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
 
         dist.init_process_group(
             "nccl",
@@ -223,6 +227,32 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def launch(self, batch: Batch, ticket: int):
+        seqs = batch.seqs
+        input_ids, positions = self.prepare_prefill(seqs) if batch.is_prefill else self.prepare_decode(seqs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, batch.is_prefill)
+        if self.rank == 0:
+            next_tokens_gpu = self.sampler(logits, temperatures).to(torch.int32)
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record()
+            self._pending_outputs[ticket] = (next_tokens_cpu, copy_done_event)
+        reset_context()
+
+    def collect(self, ticket: int) -> list[int]:
+        if self.rank != 0:
+            return []
+        pending = self._pending_outputs.pop(ticket, None)
+        if pending is None:
+            raise RuntimeError(f"no pending output for ticket={ticket}")
+        next_tokens_cpu, copy_done_event = pending
+        copy_done_event.synchronize()
+        return next_tokens_cpu.tolist()
+
+    def new_ticket(self) -> int:
+        return next(self._ticket_counter)
 
     @torch.inference_mode()
     def capture_cudagraph(self):

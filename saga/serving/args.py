@@ -63,19 +63,19 @@ def parse_args(argv: list[str] | None = None) -> ServerArgs:
     parser.add_argument(
         "--disable-continuous-batching",
         action="store_true",
-        help="disable decode-priority continuous batching scheduler policy",
+        help="disable chunked prefill budget cap and use max-num-batched-tokens as prefill budget",
     )
     parser.add_argument(
         "--decode-steps-per-prefill",
         type=int,
         default=_config_default("decode_steps_per_prefill"),
-        help="when running and waiting coexist, run this many decode steps before one prefill step",
+        help="reserved for compatibility; mini-sglang style scheduler does not use this knob",
     )
     parser.add_argument(
         "--max-prefill-tokens-per-step",
         type=int,
         default=_config_default("max_prefill_tokens_per_step"),
-        help="prefill token cap per scheduler step when running and waiting coexist",
+        help="chunked prefill token budget per scheduler step",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=_config_default("gpu_memory_utilization"))
     parser.add_argument("--tensor-parallel-size", type=int, default=_config_default("tensor_parallel_size"))
