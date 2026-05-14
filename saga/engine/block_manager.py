@@ -1,8 +1,24 @@
 from collections import deque
-import xxhash
-import numpy as np
+import time
 
 from saga.engine.sequence import Sequence
+
+
+class RadixTreeNode:
+
+    def __init__(self, key: tuple[int, ...] | None, parent: "RadixTreeNode | None"):
+        self.key = key
+        self.parent = parent
+        self.children: dict[tuple[int, ...], RadixTreeNode] = {}
+        self.block_ids: set[int] = set()
+        self.timestamp_ns = time.monotonic_ns()
+
+    def touch(self):
+        self.timestamp_ns = time.monotonic_ns()
+
+    @property
+    def is_root(self) -> bool:
+        return self.parent is None
 
 
 class Block:
@@ -10,17 +26,17 @@ class Block:
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_count = 0
-        self.hash = -1
-        self.token_ids = []
+        self.token_ids: tuple[int, ...] = ()
+        self.cache_node: RadixTreeNode | None = None
 
-    def update(self, hash: int, token_ids: list[int]):
-        self.hash = hash
+    def update(self, token_ids: tuple[int, ...], cache_node: RadixTreeNode):
         self.token_ids = token_ids
+        self.cache_node = cache_node
 
     def reset(self):
         self.ref_count = 1
-        self.hash = -1
-        self.token_ids = []
+        self.token_ids = ()
+        self.cache_node = None
 
 
 class BlockManager:
@@ -28,7 +44,7 @@ class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_ids: dict[int, set[int]] = dict()
+        self.radix_root = RadixTreeNode(None, None)
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
         self._reset_prefix_cache_stats()
@@ -65,38 +81,31 @@ class BlockManager:
             self._reset_prefix_cache_stats()
         return stats
 
-    @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        h = xxhash.xxh64()
-        if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
-        return h.intdigest()
+    def _cleanup_node(self, node: RadixTreeNode):
+        while not node.is_root and not node.children and not node.block_ids:
+            parent = node.parent
+            assert parent is not None and node.key is not None
+            del parent.children[node.key]
+            node = parent
+
+    def _detach_block_from_cache(self, block_id: int):
+        block = self.blocks[block_id]
+        node = block.cache_node
+        if node is None:
+            return
+        node.block_ids.discard(block_id)
+        block.cache_node = None
+        block.token_ids = ()
+        self._cleanup_node(node)
 
     def _allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()
         block = self.blocks[block_id]
         assert block.ref_count == 0
-        if block.hash != -1:
-            self._remove_block_hash(block.hash, block_id)
+        self._detach_block_from_cache(block_id)
         block.reset()
         self.used_block_ids.add(block_id)
         return block_id
-
-    def _add_block_hash(self, hash_value: int, block_id: int):
-        block_ids = self.hash_to_block_ids.get(hash_value)
-        if block_ids is None:
-            self.hash_to_block_ids[hash_value] = {block_id}
-            return
-        block_ids.add(block_id)
-
-    def _remove_block_hash(self, hash_value: int, block_id: int):
-        block_ids = self.hash_to_block_ids.get(hash_value)
-        if block_ids is None:
-            return
-        block_ids.discard(block_id)
-        if not block_ids:
-            del self.hash_to_block_ids[hash_value]
 
     def _touch_free_block(self, block_id: int):
         if block_id in self.used_block_ids:
@@ -107,20 +116,45 @@ class BlockManager:
             return
         self.free_block_ids.append(block_id)
 
-    def _find_cached_block(self, hash_value: int, token_ids: list[int]) -> int:
-        block_ids = self.hash_to_block_ids.get(hash_value)
-        if not block_ids:
-            return -1
+    def _pick_cached_block_id(self, node: RadixTreeNode, token_ids: tuple[int, ...]) -> int:
+        stale_block_ids: list[int] = []
+        used_candidate = -1
         free_candidate = -1
-        for block_id in block_ids:
-            if self.blocks[block_id].token_ids != token_ids:
+        for block_id in tuple(node.block_ids):
+            block = self.blocks[block_id]
+            if block.cache_node is not node or block.token_ids != token_ids:
+                stale_block_ids.append(block_id)
                 continue
-            # Prefer already-used blocks to reduce pressure on the free queue.
             if block_id in self.used_block_ids:
-                return block_id
+                used_candidate = block_id
+                break
             if free_candidate == -1:
                 free_candidate = block_id
+        for block_id in stale_block_ids:
+            node.block_ids.discard(block_id)
+        if used_candidate != -1:
+            return used_candidate
         return free_candidate
+
+    def _match_cached_prefix(self, seq: Sequence) -> list[int]:
+        node = self.radix_root
+        matched: list[int] = []
+        num_full_blocks = seq.num_tokens // self.block_size
+        for i in range(num_full_blocks):
+            token_ids = tuple(seq.block(i))
+            child = node.children.get(token_ids)
+            if child is None:
+                break
+            block_id = self._pick_cached_block_id(child, token_ids)
+            if block_id == -1:
+                self._cleanup_node(child)
+                break
+            if block_id not in self.used_block_ids:
+                self._touch_free_block(block_id)
+            child.touch()
+            matched.append(block_id)
+            node = child
+        return matched
 
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
@@ -128,19 +162,10 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
-        h = -1
-        num_cached_blocks = 0
+        matched_block_ids = self._match_cached_prefix(seq)
+        num_cached_blocks = len(matched_block_ids)
         num_new_blocks = seq.num_blocks
-        # Prefix cache only contains full blocks.
-        num_full_blocks = seq.num_tokens // self.block_size
-        for i in range(num_full_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self._find_cached_block(h, token_ids)
-            if block_id == -1:
-                break
-            num_cached_blocks += 1
-            self._touch_free_block(block_id)
+        for block_id in matched_block_ids:
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
 
@@ -162,12 +187,15 @@ class BlockManager:
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
-        h = -1
+        node = self.radix_root
         for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self._find_cached_block(h, token_ids)
-            assert block_id != -1
+            token_ids = tuple(seq.block(i))
+            child = node.children.get(token_ids)
+            if child is None:
+                raise RuntimeError("radix cache inconsistent: missing cached child node")
+            block_id = self._pick_cached_block_id(child, token_ids)
+            if block_id == -1:
+                raise RuntimeError("radix cache inconsistent: missing cached block id")
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
                 block.ref_count += 1
@@ -175,7 +203,9 @@ class BlockManager:
                 block.ref_count = 1
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
+            child.touch()
             seq.block_table.append(block_id)
+            node = child
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
@@ -203,13 +233,33 @@ class BlockManager:
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        if start == end: return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        if start == end:
+            return
+
+        node = self.radix_root
+        for i in range(start):
+            token_ids = tuple(seq.block(i))
+            child = node.children.get(token_ids)
+            if child is None:
+                child = RadixTreeNode(token_ids, node)
+                node.children[token_ids] = child
+            node = child
+            node.touch()
+
         for i in range(start, end):
+            token_ids = tuple(seq.block(i))
+            child = node.children.get(token_ids)
+            if child is None:
+                child = RadixTreeNode(token_ids, node)
+                node.children[token_ids] = child
+            block_id = seq.block_table[i]
             block = self.blocks[seq.block_table[i]]
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            if block.hash != -1 and block.hash != h:
-                self._remove_block_hash(block.hash, block.block_id)
-            block.update(h, token_ids)
-            self._add_block_hash(h, block.block_id)
+            if block.cache_node is not child:
+                self._detach_block_from_cache(block_id)
+                child.block_ids.add(block_id)
+                block.update(token_ids, child)
+            else:
+                child.block_ids.add(block_id)
+                block.token_ids = token_ids
+            child.touch()
+            node = child
