@@ -24,6 +24,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.shm_name = f"saga_shm_{config.dist_init_port}"
         self._ticket_counter = count()
         self._pending_outputs: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
 
@@ -40,10 +41,6 @@ class ModelRunner:
         model_cls = get_model_class(hf_config, config.hf_architectures)
         self.model = model_cls(hf_config)
         self.full_context_mode = bool(getattr(self.model, "full_context_mode", False))
-        if self.full_context_mode and self.world_size > 1:
-            raise ValueError(
-                "Qwen3.5 linear-attention runtime currently supports tensor_parallel_size=1 only"
-            )
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -55,11 +52,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="saga", create=True, size=2**20)
+                self.shm = SharedMemory(name=self.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="saga")
+                self.shm = SharedMemory(name=self.shm_name)
                 self.loop()
 
     def exit(self):
@@ -90,7 +87,24 @@ class ModelRunner:
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
+        forced_full_state_seqs = []
+        if self.full_context_mode and method_name in {"launch", "run"}:
+            seqs = None
+            if method_name == "launch" and args:
+                batch = args[0]
+                seqs = getattr(batch, "seqs", None)
+            elif method_name == "run" and args:
+                seqs = args[0]
+            if seqs is not None:
+                for seq in seqs:
+                    seq.force_full_state = True
+                    forced_full_state_seqs.append(seq)
+        try:
+            data = pickle.dumps([method_name, *args])
+        finally:
+            for seq in forced_full_state_seqs:
+                if hasattr(seq, "force_full_state"):
+                    delattr(seq, "force_full_state")
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data

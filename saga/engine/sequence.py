@@ -70,7 +70,8 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        last_state = self.last_token if not self.is_prefill else self.token_ids
+        force_full_state = bool(getattr(self, "force_full_state", False))
+        last_state = self.token_ids if (self.is_prefill or force_full_state) else self.last_token
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
 
     def __setstate__(self, state):

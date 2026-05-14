@@ -154,7 +154,7 @@ python3 benchmark/bench_online.py \
 
 ## 当前限制
 
-- Qwen3.5 线性注意力路径当前采用 full-context 重算模式，当前仅支持 `tensor_parallel_size=1`。
+- Qwen3.5 线性注意力路径当前采用 full-context 重算模式（会影响长上下文吞吐）。
 - `SamplingParams` 不允许贪心采样（`temperature` 必须大于 `1e-10`）。
 - `model` 参数要求是本地目录路径。
 - `tensor_parallel_size` 当前限制在 `1~8`，且需不超过可见 GPU 数。

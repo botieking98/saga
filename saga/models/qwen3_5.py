@@ -315,6 +315,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.head_k_dim = int(config.linear_key_head_dim)
         self.head_v_dim = int(config.linear_value_head_dim)
+        self.total_key_dim = self.total_num_k_heads * self.head_k_dim
+        self.total_value_dim = self.total_num_v_heads * self.head_v_dim
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -322,9 +324,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.in_proj_qkv = ColumnParallelLinear(
             self.hidden_size,
-            (self.total_num_k_heads * self.head_k_dim) * 2 + (self.total_num_v_heads * self.head_v_dim),
+            self.total_key_dim * 2 + self.total_value_dim,
             bias=False,
         )
+        self.in_proj_qkv.weight.weight_loader = self._in_proj_qkv_weight_loader
         self.in_proj_z = ColumnParallelLinear(
             self.hidden_size,
             self.total_num_v_heads * self.head_v_dim,
@@ -376,8 +379,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if loaded_weight.shape == param.data.shape:
             param.data.copy_(loaded_weight)
             return
-        local = loaded_weight.chunk(self.tp_size, dim=0)[self.tp_rank]
-        param.data.copy_(local)
+        q, k, v = loaded_weight.split([self.total_key_dim, self.total_key_dim, self.total_value_dim], dim=0)
+        q = q.chunk(self.tp_size, dim=0)[self.tp_rank]
+        k = k.chunk(self.tp_size, dim=0)[self.tp_rank]
+        v = v.chunk(self.tp_size, dim=0)[self.tp_rank]
+        param.data.copy_(torch.cat((q, k, v), dim=0))
+
+    def _in_proj_qkv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if loaded_weight.shape == param.data.shape:
+            param.data.copy_(loaded_weight)
+            return
+        q, k, v = loaded_weight.split([self.total_key_dim, self.total_key_dim, self.total_value_dim], dim=0)
+        q = q.chunk(self.tp_size, dim=0)[self.tp_rank]
+        k = k.chunk(self.tp_size, dim=0)[self.tp_rank]
+        v = v.chunk(self.tp_size, dim=0)[self.tp_rank]
+        param.data.copy_(torch.cat((q, k, v), dim=0))
 
     def _forward_one_seq(self, hidden_states: torch.Tensor) -> torch.Tensor:
         seq_len = hidden_states.size(0)
