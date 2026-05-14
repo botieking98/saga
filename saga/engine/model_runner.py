@@ -8,7 +8,7 @@ from multiprocessing.shared_memory import SharedMemory
 from saga.config import Config
 from saga.engine.sequence import Sequence
 from saga.engine.scheduler import Batch
-from saga.models.qwen3 import Qwen3ForCausalLM
+from saga.models.register import get_model_class
 from saga.layers.sampler import Sampler
 from saga.utils.context import set_context, get_context, reset_context
 from saga.utils.loader import load_model
@@ -37,12 +37,18 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_cls = get_model_class(hf_config, config.hf_architectures)
+        self.model = model_cls(hf_config)
+        self.full_context_mode = bool(getattr(self.model, "full_context_mode", False))
+        if self.full_context_mode and self.world_size > 1:
+            raise ValueError(
+                "Qwen3.5 linear-attention runtime currently supports tensor_parallel_size=1 only"
+            )
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        if not self.enforce_eager and not self.full_context_mode:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -62,7 +68,7 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if not self.enforce_eager and not self.full_context_mode:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
@@ -118,10 +124,18 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        num_kv_layers = int(getattr(self.model, "num_kv_cache_layers", hf_config.num_hidden_layers))
+        if num_kv_layers == 0:
+            config.num_kvcache_blocks = max(
+                1,
+                (config.max_model_len * config.max_num_seqs + self.block_size - 1) // self.block_size,
+            )
+            self.kv_cache = torch.empty(0, device="cuda")
+            return
+        block_bytes = 2 * num_kv_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, num_kv_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -196,6 +210,37 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    def prepare_full_context(self, seqs: list[Sequence]):
+        input_ids = []
+        positions = []
+        cu_seqlens = [0]
+        max_seqlen = 0
+        slot_mapping = []
+
+        for seq in seqs:
+            seqlen = len(seq)
+            input_ids.extend(seq[:])
+            positions.extend(range(seqlen))
+            cu_seqlens.append(cu_seqlens[-1] + seqlen)
+            max_seqlen = max(max_seqlen, seqlen)
+            if not seq.block_table:
+                slot_mapping.extend([-1] * seqlen)
+                continue
+            for i in range(seq.num_blocks):
+                slot_start = seq.block_table[i] * self.block_size
+                if i != seq.num_blocks - 1:
+                    slot_end = slot_start + self.block_size
+                else:
+                    slot_end = slot_start + seq.last_block_num_tokens
+                slot_mapping.extend(range(slot_start, slot_end))
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, slot_mapping, None, None)
+        return input_ids, positions
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -203,7 +248,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if self.full_context_mode or is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -221,18 +266,28 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        if self.full_context_mode:
+            input_ids, positions = self.prepare_full_context(seqs)
+            runtime_is_prefill = True
+        else:
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+            runtime_is_prefill = is_prefill
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, runtime_is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
     def launch(self, batch: Batch, ticket: int):
         seqs = batch.seqs
-        input_ids, positions = self.prepare_prefill(seqs) if batch.is_prefill else self.prepare_decode(seqs)
+        if self.full_context_mode:
+            input_ids, positions = self.prepare_full_context(seqs)
+            runtime_is_prefill = True
+        else:
+            input_ids, positions = self.prepare_prefill(seqs) if batch.is_prefill else self.prepare_decode(seqs)
+            runtime_is_prefill = batch.is_prefill
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, batch.is_prefill)
+        logits = self.run_model(input_ids, positions, runtime_is_prefill)
         if self.rank == 0:
             next_tokens_gpu = self.sampler(logits, temperatures).to(torch.int32)
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)

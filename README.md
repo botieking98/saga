@@ -3,7 +3,7 @@
 `saga` 是一个轻量级的LLM推理引擎实现，代码尽量保持简洁，便于学习和二次改造。
 
 当前实现重点：
-- Qwen3 Causal LM 推理
+- Qwen3 / Qwen3.5 / Qwen3.5-MoE（HF 权重兼容）
 - Prefill / Decode 调度
 - KV Cache Block 管理与复用
 - FlashAttention + Triton 加速
@@ -154,7 +154,7 @@ python3 benchmark/bench_online.py \
 
 ## 当前限制
 
-- 当前模型实现聚焦 Qwen3（见 `saga/models/qwen3.py`）。
+- Qwen3.5 线性注意力路径当前采用 full-context 重算模式，当前仅支持 `tensor_parallel_size=1`。
 - `SamplingParams` 不允许贪心采样（`temperature` 必须大于 `1e-10`）。
 - `model` 参数要求是本地目录路径。
 - `tensor_parallel_size` 当前限制在 `1~8`，且需不超过可见 GPU 数。
@@ -166,6 +166,6 @@ python3 benchmark/bench_online.py \
 saga/
   engine/     # 调度、执行、并行与 KV cache 流程
   layers/     # 核心算子与注意力实现
-  models/     # 模型定义（当前为 Qwen3）
+  models/     # 模型定义（Qwen3 / Qwen3.5 / Qwen3.5-MoE）
   utils/      # 权重加载与上下文工具
 ```
